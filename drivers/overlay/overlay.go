@@ -102,6 +102,7 @@ type overlayOptions struct {
 	skipMountHome     bool
 	mountOptions      string
 	ignoreChownErrors bool
+	squashmount       bool
 	forceMask         *os.FileMode
 }
 
@@ -293,7 +294,6 @@ func Init(home string, options graphdriver.Options) (graphdriver.Driver, error) 
 	if err := idtools.MkdirAllAs(runhome, 0700, rootUID, rootGID); err != nil {
 		return nil, err
 	}
-
 	var usingMetacopy bool
 	var supportsDType bool
 	var supportsVolatile *bool
@@ -480,6 +480,12 @@ func parseOptions(options []string) (*overlayOptions, error) {
 			if err != nil {
 				return nil, err
 			}
+		case "squashmount":
+			logrus.Debugf("overlay: squashmount=%s", val)
+			o.squashmount, err = strconv.ParseBool(val)
+			if err != nil {
+				return nil, err
+			}
 		case "force_mask":
 			logrus.Debugf("overlay: force_mask=%s", val)
 			var mask int64
@@ -643,6 +649,7 @@ func supportsOverlay(home string, homeMagic graphdriver.FsMagic, rootUID, rootGI
 			logrus.Debugf("unable to create kernel-style whiteout: %v", err)
 			return supportsDType, errors.Wrapf(err, "unable to create kernel-style whiteout")
 		}
+		logrus.Debugf("Can support kernel style whiteout")
 
 		if len(flags) < unix.Getpagesize() {
 			err := unix.Mount("overlay", mergedDir, "overlay", 0, flags)
@@ -842,6 +849,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
 
+	logrus.Debugf("Driver create function")
 	uidMaps := d.uidMaps
 	gidMaps := d.gidMaps
 
@@ -1027,6 +1035,7 @@ func (d *Driver) dir(id string) string {
 
 func (d *Driver) getLowerDirs(id string) ([]string, error) {
 	var lowersArray []string
+
 	lowers, err := ioutil.ReadFile(path.Join(d.dir(id), lowerFile))
 	if err == nil {
 		for _, s := range strings.Split(string(lowers), ":") {
@@ -1214,6 +1223,33 @@ func (d *Driver) Get(id string, options graphdriver.MountOpts) (_ string, retErr
 	return d.get(id, false, options)
 }
 
+func (d *Driver) mount_lower_squashfuse(archive string, mountpoint string) (_ string, retErr error) {
+	logrus.Debugf("mount_lower_squashfuse")
+
+	logrus.Debugf("squash archive: %s, squash_mount: %s", archive, mountpoint)
+
+	err := os.MkdirAll(mountpoint, 0700)
+	if err != nil {
+		logrus.Errorf("Could not make %s", mountpoint)
+		return "", err
+	}
+	mount_program := "/usr/local/bin/squashfuse"
+
+	var outb, errb bytes.Buffer
+	cmd := exec.Command(mount_program, archive, mountpoint)
+	cmd.Stdout = &outb
+	cmd.Stderr = &errb
+	err = cmd.Run()
+
+	if err != nil {
+		logrus.Errorf(errb.String())
+		logrus.Errorf("Could not mount archive successfully")
+		return "", err
+	}
+	logrus.Debugf(outb.String())
+	return mountpoint, nil
+}
+
 func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountOpts) (_ string, retErr error) {
 	d.locker.Lock(id)
 	defer d.locker.Unlock(id)
@@ -1359,6 +1395,42 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 		absLowers = append(absLowers, path.Join(dir, "empty"))
 		relLowers = append(relLowers, path.Join(id, "empty"))
 	}
+	// Mount lower dir as a squash archive.
+
+	var lowerDirs string
+	lowerDirs = strings.Join(absLowers, ":")
+	logrus.Debugf("Lowerdir: %s", lowerDirs)
+	if d.options.squashmount == true {
+		var (
+			squash_ok    bool
+			squash_mount string
+			squash_dir   string
+		)
+		// squash file is named with the link name of the top layer plus ".squash"
+		toplayer := absLowers[0]
+		var archive string
+		archive = toplayer + ".squash"
+		_, err := os.Stat(archive)
+		if err != nil {
+			squash_ok = false
+		} else {
+			// Create the squash dir
+			squash_dir = path.Join(dir, "squashfs")
+			_mount, err := d.mount_lower_squashfuse(archive, squash_dir)
+			if err != nil {
+				logrus.Errorf("Could not mount squash archive %s", archive)
+				squash_ok = false
+			} else {
+				squash_mount = _mount
+				squash_ok = true
+			}
+		}
+		if squash_ok == true {
+			lowerDirs = squash_mount
+			logrus.Debugf("Changing lower dir to: %s", lowerDirs)
+		}
+	}
+
 	// user namespace requires this to move a directory from lower to upper.
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
 	if err != nil {
@@ -1368,7 +1440,6 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 	if err := idtools.MkdirAllAs(diffDir, perms, rootUID, rootGID); err != nil {
 		return "", err
 	}
-
 	mergedDir := path.Join(dir, "merged")
 	// Create the driver merged dir
 	if err := idtools.MkdirAs(mergedDir, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
@@ -1391,9 +1462,9 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 
 	var opts string
 	if readWrite {
-		opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(absLowers, ":"), diffDir, workdir)
+		opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDirs, diffDir, workdir)
 	} else {
-		opts = fmt.Sprintf("lowerdir=%s:%s", diffDir, strings.Join(absLowers, ":"))
+		opts = fmt.Sprintf("lowerdir=%s:%s", diffDir, lowerDirs)
 	}
 	if len(optsList) > 0 {
 		opts = fmt.Sprintf("%s,%s", strings.Join(optsList, ","), opts)
@@ -1449,9 +1520,9 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 		//FIXME: We need to figure out to get this to work with additional stores
 		if readWrite {
 			diffDir := path.Join(id, "diff")
-			opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(relLowers, ":"), diffDir, workdir)
+			opts = fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDirs, diffDir, workdir)
 		} else {
-			opts = fmt.Sprintf("lowerdir=%s", strings.Join(absLowers, ":"))
+			opts = fmt.Sprintf("lowerdir=%s", lowerDirs)
 		}
 		mountData = label.FormatMountLabel(opts, options.MountLabel)
 		if len(mountData) > pageSize {

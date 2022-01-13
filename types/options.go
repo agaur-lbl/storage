@@ -211,6 +211,15 @@ func getRootlessStorageOpts(rootlessUID int, systemOpts StoreOptions) (StoreOpti
 				}
 			}
 		}
+		if opts.GraphDriverName == overlayDriver {
+			for _, o := range systemOpts.GraphDriverOptions {
+				if strings.Contains(o, "squashmount") {
+					opts.GraphDriverOptions = append(opts.GraphDriverOptions, o)
+					break
+				}
+			}
+		}
+
 	}
 	if opts.GraphDriverName == "" {
 		opts.GraphDriverName = "vfs"
