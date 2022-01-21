@@ -1559,6 +1559,7 @@ func (d *Driver) Put(id string) error {
 		return err
 	}
 	mountpoint := path.Join(dir, "merged")
+	squash_mount := path.Join(dir, "squashfs")
 	if count := d.ctr.Decrement(mountpoint); count > 0 {
 		return nil
 	}
@@ -1567,7 +1568,14 @@ func (d *Driver) Put(id string) error {
 	}
 
 	unmounted := false
+	unmount_squash := false
 
+	if d.options.squashmount == true {
+		_, err := os.Stat(squash_mount)
+		if err == nil {
+			unmount_squash = true
+		}
+	}
 	if d.options.mountProgram != "" {
 		// Attempt to unmount the FUSE mount using either fusermount or fusermount3.
 		// If they fail, fallback to unix.Unmount
@@ -1578,8 +1586,18 @@ func (d *Driver) Put(id string) error {
 			}
 			if err == nil {
 				unmounted = true
+			}
+			if unmount_squash == true && unmounted == true {
+				err := exec.Command(v, "-u", squash_mount).Run()
+				if err != nil {
+					logrus.Debugf("Error unmounting %s filesytem %s - %v", squash_mount, v, err)
+				}
+			}
+
+			if unmounted == true {
 				break
 			}
+
 		}
 		// If fusermount|fusermount3 failed to unmount the FUSE file system, make sure all
 		// pending changes are propagated to the file system
@@ -1598,10 +1616,22 @@ func (d *Driver) Put(id string) error {
 		if err := unix.Unmount(mountpoint, unix.MNT_DETACH); err != nil && !os.IsNotExist(err) {
 			logrus.Debugf("Failed to unmount %s overlay: %s - %v", id, mountpoint, err)
 		}
+		if unmount_squash == true {
+			err := unix.Unmount(squash_mount, unix.MNT_DETACH)
+			if err != nil {
+				logrus.Debugf("Failed to unmount %s - %s", squash_mount, err)
+			}
+		}
 	}
 
 	if err := unix.Rmdir(mountpoint); err != nil && !os.IsNotExist(err) {
 		logrus.Debugf("Failed to remove mountpoint %s overlay: %s - %v", id, mountpoint, err)
+	}
+
+	if unmount_squash == true {
+		if err := unix.Rmdir(squash_mount); err != nil && !os.IsNotExist(err) {
+			logrus.Debugf("Failed to delete %s - %s", squash_mount, err)
+		}
 	}
 
 	return nil
