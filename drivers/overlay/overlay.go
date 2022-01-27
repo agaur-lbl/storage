@@ -1233,7 +1233,7 @@ func (d *Driver) mount_lower_squashfuse(archive string, mountpoint string) (_ st
 		logrus.Errorf("Could not make %s", mountpoint)
 		return "", err
 	}
-	mount_program := "/usr/local/bin/squashfuse"
+	mount_program := "/usr/bin/squashfuse"
 
 	var outb, errb bytes.Buffer
 	cmd := exec.Command(mount_program, archive, mountpoint)
